@@ -1,61 +1,103 @@
-from paddleocr import PaddleOCR
 import pandas as pd
 import numpy as np
 import os, re
 from collections import defaultdict, Counter
 from sklearn.cluster import KMeans
+import streamlit as st
+
+# Set environment variables before importing PaddleOCR
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Global OCR instance
+ocr_instance = None
+
+try:
+    from paddleocr import PaddleOCR
+
+
+    # Initialize with cloud-friendly settings
+    @st.cache_resource
+    def load_ocr():
+        return PaddleOCR(
+            use_angle_cls=True,
+            lang='en',
+            show_log=False,
+            use_gpu=False,
+            enable_mkldnn=False,
+            cpu_threads=1
+        )
+
+
+    ocr_instance = load_ocr()
+
+except Exception as e:
+    st.error(f"Failed to initialize PaddleOCR: {e}")
+    ocr_instance = None
 
 # ========= CONFIG =========
-COLUMNS = ['Name', 'Company Name', 'Category', 'Invited by', 'Fees',' Payment Mode', 'Date']  # Removed '#' column
+COLUMNS = ['Name', 'Company Name', 'Category', 'Invited by', 'Fees', 'Payment Mode', 'Date']
 
 
 def extract_data_from_image(image_path):
-    # Initialize OCR
-    ocr = PaddleOCR(use_textline_orientation=True, lang='en')
-    res = ocr.predict(image_path)
+    """Extract data from image using PaddleOCR"""
 
-    if not (isinstance(res, list) and len(res) and isinstance(res[0], dict)):
-        raise RuntimeError("No OCR result")
+    if ocr_instance is None:
+        raise RuntimeError("PaddleOCR not initialized properly")
 
-    rec_texts = res[0].get('rec_texts', [])
-    dt_polys = res[0].get('dt_polys', [])
-    rec_scores = res[0].get('rec_scores', [1.0] * len(rec_texts))
+    try:
+        # Use the cached OCR instance
+        result = ocr_instance.ocr(image_path, cls=True)
 
-    ocr_items = []
-    for t, poly, sc in zip(rec_texts, dt_polys, rec_scores):
-        if not t:
-            continue
-        xs = [p[0] for p in poly];
-        ys = [p[1] for p in poly]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        ocr_items.append({
-            "text": t.strip(),
-            "score": float(sc),
-            "x": (x_min + x_max) / 2.0,
-            "y": (y_min + y_max) / 2.0,
-            "xmin": x_min, "xmax": x_max,
-            "ymin": y_min, "ymax": y_max,
-            "w": x_max - x_min,
-            "h": y_max - y_min
-        })
+        if not result or not result[0]:
+            raise RuntimeError("No OCR result returned")
 
-    if not ocr_items:
-        raise RuntimeError("No OCR items parsed")
+        # Extract OCR data
+        ocr_items = []
+        for line in result[0]:
+            bbox, (text, confidence) = line
+            if not text or confidence < 0.5:  # Skip low confidence results
+                continue
+
+            # Calculate bounding box center and dimensions
+            xs = [point[0] for point in bbox]
+            ys = [point[1] for point in bbox]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+
+            ocr_items.append({
+                "text": text.strip(),
+                "score": float(confidence),
+                "x": (x_min + x_max) / 2.0,
+                "y": (y_min + y_max) / 2.0,
+                "xmin": x_min, "xmax": x_max,
+                "ymin": y_min, "ymax": y_max,
+                "w": x_max - x_min,
+                "h": y_max - y_min
+            })
+
+        if not ocr_items:
+            raise RuntimeError("No valid OCR items parsed")
+
+        return process_ocr_data(ocr_items)
+
+    except Exception as e:
+        st.error(f"OCR processing failed: {str(e)}")
+        return pd.DataFrame(columns=COLUMNS)  # Return empty DataFrame
+
+
+def process_ocr_data(ocr_items):
+    """Process OCR items and return structured DataFrame"""
 
     # ========= Helpers =========
     num_re = re.compile(r'^\d{1,2}\.?$')
-    #time_re = re.compile(r'^\s*(?:[0-2]?\d)[:.][0-5]\d\s*$')  # 7:35, 7.35, 07:25 etc
-    moneyish_re = re.compile(r'^\s*[\d,.]{3,}\s*$')  # 7000, 9,000, 12135
+    moneyish_re = re.compile(r'^\s*[\d,.]{3,}\s*$')
     cash_tokens = {"cash", "done", "online", "upi", "od", "cheque", "dd"}
 
-    #return bool(num_re.match(t))
     def is_row_number(txt):
         t = txt.strip().replace(' ', '')
         return bool(num_re.match(t))
-    #def is_time(txt):
-        #t = txt.strip().lower().replace('~', '').replace('^', '')
-       # return (':' in t or '.' in t) and bool(time_re.match(t))
 
     def is_money(txt):
         t = txt.strip().lower()
@@ -80,16 +122,18 @@ def extract_data_from_image(image_path):
         data_items = [it for it in ocr_items if it["y"] >= first_y - 10]
         data_items.sort(key=lambda d: (d["y"], d["x"]))
 
-    # ========= 2) Build row bands from the "#" column =========
+    # ========= 2) Build row bands =========
     rownums = [it for it in data_items if is_row_number(it["text"])]
     rownums.sort(key=lambda d: d["y"])
 
+    # Remove duplicates based on Y position
     deduped = []
     for it in rownums:
         if not deduped or abs(it["y"] - deduped[-1]["y"]) > np.median([r["h"] for r in rownums]) * 0.6:
             deduped.append(it)
     rownums = deduped
 
+    # Create row bands using K-means if not enough row numbers
     if len(rownums) < 5:
         ys = np.array([d["y"] for d in data_items]).reshape(-1, 1)
         median_h = np.median([d["h"] for d in data_items])
@@ -103,18 +147,18 @@ def extract_data_from_image(image_path):
     row_centers = sorted(row_centers)
     bands = []
     for i, yc in enumerate(row_centers):
-        y_top = (row_centers[i - 1] + yc) / 2 if i > 0 else yc - 1000  # large top
+        y_top = (row_centers[i - 1] + yc) / 2 if i > 0 else yc - 1000
         y_bot = (yc + row_centers[i + 1]) / 2 if i < len(row_centers) - 1 else yc + 1000
         bands.append((y_top, y_bot, yc))
 
+    # Assign items to rows
     rows = [[] for _ in bands]
     for it in data_items:
         y = it["y"]
-        lo, hi = 0, len(bands) - 1
         idx = None
         for j, (yt, yb, yc) in enumerate(bands):
             if yt <= y < yb:
-                idx = j;
+                idx = j
                 break
         if idx is None:
             dists = [abs(y - b[2]) for b in bands]
@@ -133,84 +177,50 @@ def extract_data_from_image(image_path):
 
     rows = trim_empty_row_edges(rows)
 
-    # ========= 3) Column detection (cluster x, then label) =========
-    # Filter out row numbers from clustering to avoid confusion
+    # ========= 3) Column detection =========
     flat = []
     for row in rows:
         for it in row:
-            if not is_row_number(it["text"]):  # Exclude row numbers from column clustering
+            if not is_row_number(it["text"]):
                 flat.append(it)
 
     if not flat:
         raise RuntimeError("No table-like cells after banding")
 
     X = np.array([it["x"] for it in flat]).reshape(-1, 1)
-    k = len(COLUMNS)  # Use the actual number of columns we want (5)
+    k = len(COLUMNS)
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10).fit(X)
     centers = sorted(kmeans.cluster_centers_.flatten())
 
     def cluster_idx(x):
         return int(np.argmin([abs(x - c) for c in centers]))
 
-    stats = {i: Counter() for i in range(k)}
-    examples = {i: [] for i in range(k)}
-    for it in flat:
-        ci = cluster_idx(it["x"])
-        t = it["text"]
-        if is_row_number(t): stats[ci]["rownum"] += 1
-        if is_alphaish(t):   stats[ci]["alpha"] += 1
-        if is_money(t):      stats[ci]["money"] += 1
-        #if is_time(t):       stats[ci]["time"] += 1
-        examples[ci].append(t)
+    # Sort clusters left to right
+    sorted_clusters = sorted(range(k), key=lambda i: centers[i])
 
-    # Build cluster-to-column assignment
-    ordered_clusters = list(range(k))  # assuming k == 5
+    # Map clusters to columns
+    cluster_to_col = {cluster: i for i, cluster in enumerate(sorted_clusters)}
 
-    # Sort clusters left to right based on x-coordinate
-    sorted_clusters = sorted(ordered_clusters, key=lambda i: centers[i])
-
-    # Assign them left-to-right to expected columns
-    expected_columns = ['Name', 'Company Name', 'Category', 'Invited by', 'Fees', 'Payment Mode','Date']
-    label_map = {col: cluster for col, cluster in zip(expected_columns, sorted_clusters)}
-
-    # Now map cluster -> column index
-    cluster_to_col = {cluster: COLUMNS.index(col) for col, cluster in label_map.items()}
-
-        # ========= 4) Row assembly =========
+    # ========= 4) Row assembly =========
     processed = []
     for r_elems in rows:
         if not r_elems:
             continue
         col_dict = defaultdict(list)
 
-        # Separate row numbers from other elements
-        row_num_items = [it for it in r_elems if is_row_number(it["text"])]
+        # Process non-row-number items
         other_items = [it for it in r_elems if not is_row_number(it["text"])]
 
-        # Process non-row-number items
         for it in sorted(other_items, key=lambda d: d["x"]):
             ci = cluster_idx(it["x"])
-            col_idx = cluster_to_col.get(ci, len(COLUMNS) - 1)  # Default to last column if not found
+            col_idx = cluster_to_col.get(ci, len(COLUMNS) - 1)
             col_dict[col_idx].append(it["text"])
 
         row = [''] * len(COLUMNS)
         for ci, toks in col_dict.items():
-            if ci < len(COLUMNS):  # Ensure valid column index
+            if ci < len(COLUMNS):
                 txt = ' '.join(toks).strip()
                 row[ci] = txt
-
-        # Data cleaning and validation
-        # If Payment column has money-like text and TOA is empty, swap them
-        if len(row) > 2 and row[2] and is_money(row[2]) and not row[1]:
-            row[1], row[2] = row[2], ''
-
-        # If Name is empty and Payment has alpha text, swap them
-        if len(row) > 2 and not row[0] and row[2] and is_alphaish(row[2]):
-            row[0], row[2] = row[2], ''
-
-        # Clean signature column (remove very short non-alphabetic entries)
-        if len(row) > 4 and row[4] and len(row[4]) <= 2 and not is_alphaish(row[4]):
-            row[4] = ''
 
         # Skip completely empty rows
         if not any(x.strip() for x in row):
@@ -218,7 +228,7 @@ def extract_data_from_image(image_path):
 
         processed.append(row)
 
-    # Filter valid rows - should have at least a name or some meaningful content
+    # Filter valid rows
     final_rows = []
     for r in processed:
         has_name = bool(re.search(r'[A-Za-z]', r[0] or '')) if len(r) > 0 else False
@@ -229,8 +239,11 @@ def extract_data_from_image(image_path):
 
     df = pd.DataFrame(final_rows, columns=COLUMNS)
 
-    # Remove any rows that are completely empty after DataFrame creation
+    # Remove completely empty rows
     df = df[df.apply(lambda x: any(x.astype(str).str.strip() != ''), axis=1)]
-    df['Fees'] = df['Fees'].str.replace(r'[^\d.]', '', regex=True)
+
+    # Clean fees column
+    if 'Fees' in df.columns:
+        df['Fees'] = df['Fees'].str.replace(r'[^\d.]', '', regex=True)
 
     return df
