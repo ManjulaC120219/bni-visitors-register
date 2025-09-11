@@ -4,6 +4,7 @@ import os, re
 from collections import defaultdict, Counter
 from sklearn.cluster import KMeans
 import streamlit as st
+from datetime import datetime, date
 
 # Set environment variables before importing PaddleOCR
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -38,6 +39,50 @@ except Exception as e:
 
 # ========= CONFIG =========
 COLUMNS = ['Name', 'Company Name', 'Category', 'Invited by', 'Fees', 'Payment Mode', 'Date']
+
+
+def parse_date(date_text):
+    """
+    Parse various date formats and return a date object
+    """
+    if not date_text or pd.isna(date_text) or str(date_text).strip() == "":
+        return date.today()
+
+    date_str = str(date_text).strip()
+
+    # Common date formats to try
+    date_formats = [
+        "%Y-%m-%d",  # 2024-01-15
+        "%d/%m/%Y",  # 15/01/2024
+        "%m/%d/%Y",  # 01/15/2024
+        "%d-%m-%Y",  # 15-01-2024
+        "%m-%d-%Y",  # 01-15-2024
+        "%d.%m.%Y",  # 15.01.2024
+        "%Y/%m/%d",  # 2024/01/15
+        "%B %d, %Y",  # January 15, 2024
+        "%d %B %Y",  # 15 January 2024
+        "%d/%m/%y",  # 15/01/24
+        "%m/%d/%y",  # 01/15/24
+    ]
+
+    for fmt in date_formats:
+        try:
+            parsed_date = datetime.strptime(date_str, fmt).date()
+            return parsed_date
+        except ValueError:
+            continue
+
+    # If no format matches, try pandas
+    try:
+        parsed_date = pd.to_datetime(date_str, errors='coerce')
+        if not pd.isna(parsed_date):
+            return parsed_date.date()
+    except:
+        pass
+
+    # If all parsing fails, return today's date
+    st.warning(f"Could not parse date '{date_text}', using today's date")
+    return date.today()
 
 
 def extract_data_from_image(image_path):
@@ -245,5 +290,9 @@ def process_ocr_data(ocr_items):
     # Clean fees column
     if 'Fees' in df.columns:
         df['Fees'] = df['Fees'].str.replace(r'[^\d.]', '', regex=True)
+
+    # Parse and format dates properly
+    if 'Date' in df.columns:
+        df['Date'] = df['Date'].apply(parse_date)
 
     return df
