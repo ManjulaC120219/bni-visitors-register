@@ -1,8 +1,0 @@
-﻿streamlit
-paddlepaddle-cpu==2.5.2
-paddleocr==2.7.0.3
-opencv-python-headless==4.8.1.78
-pillow==10.0.1
-numpy==1.24.3
-protobuf==3.20.3
-shapely==1.8.5
